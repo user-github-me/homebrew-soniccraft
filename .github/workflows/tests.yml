@@ -1,0 +1,138 @@
+name: tests
+
+# Installs the formula from this checkout on every platform it supports and runs `brew test`,
+# `brew linkage --test` and `brew audit --strict --online`. One job also runs `brew style` on the whole
+# tap and loads and audits the formula for every OS and architecture. The checksums job compares the
+# formula with its release's SHA256SUMS.
+#
+# update.yml calls this workflow with `formula-artifact` to test a rewritten formula before pushing it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      formula-artifact:
+        description: An artifact of the calling run holding a soniccraft.rb to test instead of the checked-out one
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  # A called run takes the caller's workflow name, so it never cancels a run of this workflow.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+env:
+  TAP: user-github-me/soniccraft
+  FORMULA: user-github-me/soniccraft/soniccraft
+  HOMEBREW_NO_AUTO_UPDATE: "1" # setup-homebrew has just updated Homebrew
+  HOMEBREW_NO_ANALYTICS: "1"
+
+jobs:
+  checksums:
+    name: checksums match the release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use the formula under test
+        if: inputs.formula-artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.formula-artifact }}
+          path: Formula
+
+      - name: Every URL and sha256 matches the release's SHA256SUMS and archives
+        run: python3 scripts/update-formula.py --check --verify
+
+      - name: The update script turns an older formula back into this one
+        run: |
+          version="$(sed -n 's|.*/releases/download/v\([^/]*\)/.*|\1|p' Formula/soniccraft.rb | head -n 1)"
+          zeros="0000000000000000000000000000000000000000000000000000000000000000"
+          sed -e "s|/v${version}/soniccraft-v${version}-|/v0.0.1/soniccraft-v0.0.1-|" \
+            -e "s|sha256 \"[0-9a-f]\{64\}\"|sha256 \"${zeros}\"|" \
+            Formula/soniccraft.rb >"$RUNNER_TEMP/old.rb"
+          grep -q '/v0.0.1/' "$RUNNER_TEMP/old.rb"
+          python3 scripts/update-formula.py --formula "$RUNNER_TEMP/old.rb" --version "$version" --only-if-newer
+          diff -u Formula/soniccraft.rb "$RUNNER_TEMP/old.rb"
+
+  formula:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-latest
+          # Intel macOS is a Tier 3 Homebrew platform since September 2026; GitHub keeps Intel runners
+          # until the macOS 15 image retires (macos-26-intel also exists).
+          - name: macOS x86_64
+            runner: macos-15-intel
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            tap-checks: true
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # Checks this repository out as the user-github-me/soniccraft tap and trusts it; no actions/checkout.
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
+
+      - name: Cache Homebrew Bundler RubyGems
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.set-up-homebrew.outputs.gems-path }}
+          key: ${{ matrix.runner }}-rubygems-${{ steps.set-up-homebrew.outputs.gems-hash }}
+          restore-keys: ${{ matrix.runner }}-rubygems-
+
+      - name: Download the formula under test
+        if: inputs.formula-artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.formula-artifact }}
+          path: ${{ runner.temp }}/formula-under-test
+
+      - name: Put the formula under test into the tap
+        if: inputs.formula-artifact
+        run: |
+          cp "$RUNNER_TEMP/formula-under-test/soniccraft.rb" "$(brew --repository "$TAP")/Formula/soniccraft.rb"
+          git -C "$(brew --repository "$TAP")" diff --stat
+
+      - name: Style of the tap, and the formula on every OS and architecture
+        if: matrix.tap-checks
+        run: |
+          brew style "$TAP"
+          brew readall --aliases --os=all --arch=all "$TAP"
+          brew audit --strict --os=all --arch=all --formula "$FORMULA"
+          brew livecheck --formula "$FORMULA"
+
+      - name: Install
+        run: brew install --formula --verbose "$FORMULA"
+
+      - name: Test
+        run: brew test --verbose "$FORMULA"
+
+      - name: Linkage
+        run: brew linkage --test "$FORMULA"
+
+      - name: Audit
+        run: brew audit --strict --online --formula "$FORMULA"

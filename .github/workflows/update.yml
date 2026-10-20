@@ -1,0 +1,120 @@
+name: update
+
+# Once a day, and on demand, points the formula at the latest SonicCraft release if it is newer than the
+# formula's version. scripts/update-formula.py rewrites the URLs and sha256 values from the release's
+# SHA256SUMS and checks every archive against them; tests.yml then installs and tests the rewritten
+# formula on every platform, and only then is it committed and pushed. GITHUB_TOKEN is enough: the
+# release is public, and the push goes to this repository.
+
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release to point the formula at, e.g. 0.2.0 (empty means the latest release, if newer)
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: update-formula
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+jobs:
+  update:
+    name: rewrite the formula
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+      version: ${{ steps.update.outputs.new-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pick the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          if [ -n "$REQUESTED" ]; then
+            echo "version=${REQUESTED#v}" >>"$GITHUB_OUTPUT"
+            echo "only-if-newer=false" >>"$GITHUB_OUTPUT"
+          else
+            # The latest published release: never a draft or a pre-release.
+            tag="$(gh api repos/user-github-me/soniccraft/releases/latest --jq .tag_name)"
+            echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+            echo "only-if-newer=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Rewrite the URLs and sha256 values from the release's SHA256SUMS
+        id: update
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          ONLY_IF_NEWER: ${{ steps.release.outputs.only-if-newer }}
+        run: |
+          args=(--version "$VERSION" --verify)
+          if [ "$ONLY_IF_NEWER" = true ]; then
+            args+=(--only-if-newer)
+          fi
+          python3 scripts/update-formula.py "${args[@]}"
+          git diff
+
+      - name: Keep the new formula for the tests and the push
+        if: steps.update.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: formula
+          path: Formula/soniccraft.rb
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: test
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+    with:
+      formula-artifact: formula
+
+  push:
+    name: commit and push
+    needs: [update, test]
+    if: needs.update.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the new version to the branch this run started from
+    steps:
+      # The commit the update started from, with credentials for the push. If the branch has moved since,
+      # the push is rejected and the next run starts over from the new head.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get the tested formula
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: formula
+          path: Formula
+
+      - name: Commit and push
+        env:
+          VERSION: ${{ needs.update.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/soniccraft.rb
+          git commit --message "soniccraft ${VERSION}"
+          git push origin "HEAD:${GITHUB_REF}"
